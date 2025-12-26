@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>카카오맵 스마트 지역 뷰어</title>
+  <style>
+    :root {
+      --panel-bg: rgba(255, 255, 255, 0.98);
+      --shadow: 0 4px 15px rgba(0,0,0,0.12);
+      --accent: #007AFF;
+      --border: 1px solid #eaeaea;
+      --tap-height: 52px;
+    }
+    html, body { margin: 0; padding: 0; height: 100%; font-family: -apple-system, sans-serif; overflow: hidden; }
+    #map { width: 100%; height: 100%; position: absolute; top: 0; bottom: 0; background: #f0f0f0; }
+
+    /* 하단 시트 UI */
+    .sheet {
+      position: absolute; bottom: 0; left: 0; right: 0; z-index: 100;
+      background: var(--panel-bg);
+      padding: 12px 16px calc(env(safe-area-inset-bottom) + 16px);
+      border-top-left-radius: 24px; border-top-right-radius: 24px;
+      box-shadow: 0 -5px 25px rgba(0,0,0,0.08); backdrop-filter: blur(10px);
+    }
+    .handle { width: 40px; height: 4px; background: #ddd; border-radius: 2px; margin: 0 auto 16px; }
+    .sheet-title { font-size: 15px; font-weight: 800; margin-bottom: 12px; display: flex; justify-content: space-between; align-items: center; }
+    .status-badge { font-size: 11px; background: #f0f0f0; padding: 3px 10px; border-radius: 12px; color: #777; }
+
+    /* 필터 그리드 */
+    .filter-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    select {
+      height: var(--tap-height); border: var(--border); border-radius: 12px;
+      padding: 0 15px; font-size: 16px; background: #fff; width: 100%;
+      box-sizing: border-box; outline: none; -webkit-appearance: none;
+      background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' fill='%23999' viewBox='0 0 16 16'%3E%3Cpath d='M7.247 11.14 2.451 5.658C1.885 5.013 2.345 4 3.204 4h9.592a1 1 0 0 1 .753 1.659l-4.796 5.48a1 1 0 0 1-1.506 0z'/%3E%3C/svg%3E");
+      background-repeat: no-repeat; background-position: calc(100% - 15px) center;
+    }
+
+    #guideMsg { font-size: 13px; color: var(--accent); margin-top: 10px; text-align: center; font-weight: 500; }
+
+    /* 현위치 버튼 */
+    .fab-location {
+      position: absolute; right: 16px; bottom: calc(180px + env(safe-area-inset-bottom));
+      z-index: 90; width: 48px; height: 48px; background: white; border-radius: 50%;
+      display: flex; align-items: center; justify-content: center; box-shadow: var(--shadow); border: none;
+    }
+    .fab-location.on { background: var(--accent); color: white; }
+
+    /* 현위치 마커 디자인 */
+    .my-loc-dot { width: 14px; height: 14px; background: var(--accent); border: 3px solid white; border-radius: 50%; box-shadow: 0 0 8px rgba(0,122,255,0.6); position: relative; }
+    .my-loc-dir { position: absolute; top: -18px; left: 50%; transform: translateX(-50%); width: 0; height: 0; border-left: 6px solid transparent; border-right: 6px solid transparent; border-bottom: 10px solid var(--accent); }
+
+    /* 말풍선 오버레이 (상호명, 주소만 노출) */
+    .custom-info {
+      background: white; padding: 12px 14px; border-radius: 12px; font-size: 13px;
+      box-shadow: var(--shadow); border: 1px solid #eee; min-width: 160px;
+    }
+    .info-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 6px; }
+    .info-name { font-weight: bold; color: #1a1a1a; font-size: 15px; line-height: 1.2; }
+    .info-close { padding: 0 0 0 10px; color: #bbb; cursor: pointer; font-size: 18px; line-height: 1; }
+    .info-addr { color: #666; font-size: 12px; line-height: 1.4; word-break: keep-all; }
+  </style>
+  <script src="//dapi.kakao.com/v2/maps/sdk.js?appkey=07f4314a856280075f28a238f072b1c5&libraries=services"></script>
+</head>
+<body>
+
+<div id="map"></div>
+
+<button class="fab-location" id="myLocBtn">
+  <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><circle cx="12" cy="12" r="3"></circle></svg>
+</button>
+
+<div class="sheet">
+  <div class="handle"></div>
+  <div class="sheet-title">스마트 지역 뷰어 <span class="status-badge" id="dataStatus">연결 확인 중</span></div>
+  <div class="filter-grid">
+    <select id="sidoSelect"><option value="">시/도 선택</option></select>
+    <select id="sigunguSelect"><option value="">시/군/구 선택</option></select>
+  </div>
+  <div id="guideMsg">데이터를 불러오고 있습니다...</div>
+</div>
+
+<script>
+const CSV_URL = 'data.csv';
+const CACHE_KEY = 'MAP_GEO_CACHE_V2';
+let map, geocoder, allData = [], markers = [], activeOverlay = null;
+let watchId = null, myLocOverlay = null;
+
+let geoCache = JSON.parse(localStorage.getItem(CACHE_KEY) || '{}');
+
+function parseCSV(text) {
+  const lines = text.split(/\r?\n/).filter(line => line.trim() !== "");
+  if (lines.length < 2) return [];
+  const headers = lines[0].split(',').map(h => h.trim());
+  return lines.slice(1).map(line => {
+    const values = []; let cur = '', inQuotes = false;
+    for (let char of line) {
+      if (char === '"') inQuotes = !inQuotes;
+      else if (char === ',' && !inQuotes) { values.push(cur.trim()); cur = ''; }
+      else cur += char;
+    }
+    values.push(cur.trim());
+    const row = {}; headers.forEach((h, i) => row[h] = values[i] || "");
+    const addr = (row['사업자주소'] || "").trim();
+    const parts = addr.split(/\s+/);
+    row.psSido = parts[0] || "";
+    row.psSigungu = parts[1] || "";
+    return row;
+  });
+}
+
+async function init() {
+  const container = document.getElementById('map');
+  map = new kakao.maps.Map(container, { center: new kakao.maps.LatLng(37.5668, 126.9786), level: 5 });
+  geocoder = new kakao.maps.services.Geocoder();
+
+  kakao.maps.event.addListener(map, 'click', function() {
+    closeActiveOverlay();
+  });
+
+  try {
+    const response = await fetch(CSV_URL);
+    const text = await response.text();
+    const rawData = parseCSV(text);
+
+    allData = rawData.map(item => ({
+      name: item['상호명'],
+      addr: item['사업자주소'],
+      sido: item.psSido,
+      sigungu: item.psSigungu,
+      lat: parseFloat(item['위도']),
+      lng: parseFloat(item['경도'])
+    })).filter(d => d.sido);
+
+    document.getElementById('dataStatus').innerText = `${allData.length}개 로드`;
+    document.getElementById('guideMsg').innerText = "시/도를 선택하세요.";
+    setupFilters();
+  } catch (e) {
+    document.getElementById('dataStatus').innerText = "파일 로드 실패";
+  }
+}
+
+function setupFilters() {
+  const sidoSel = document.getElementById('sidoSelect');
+  const sigunguSel = document.getElementById('sigunguSelect');
+  const sidos = [...new Set(allData.map(d => d.sido))].filter(s => s.length > 1).sort();
+  sidos.forEach(s => sidoSel.add(new Option(s, s)));
+
+  sidoSel.onchange = () => {
+    sigunguSel.innerHTML = '<option value="">시/군/구 선택</option>';
+    if (sidoSel.value) {
+      const sgs = [...new Set(allData.filter(d => d.sido === sidoSel.value).map(d => d.sigungu))].filter(Boolean).sort();
+      sgs.forEach(sg => sigunguSel.add(new Option(sg, sg)));
+    }
+    clearMap();
+  };
+  sigunguSel.onchange = updateMarkers;
+}
+
+function clearMap() {
+  markers.forEach(m => m.setMap(null));
+  markers = [];
+  closeActiveOverlay();
+}
+
+function closeActiveOverlay() {
+  if (activeOverlay) {
+    activeOverlay.setMap(null);
+    activeOverlay = null;
+  }
+}
+
+async function getCoord(item) {
+  if (item.lat > 32 && item.lat < 40 && item.lng > 124 && item.lng < 133) {
+    return new kakao.maps.LatLng(item.lat, item.lng);
+  }
+  if (geoCache[item.addr]) {
+    const c = geoCache[item.addr];
+    return new kakao.maps.LatLng(c.lat, c.lng);
+  }
+  return new Promise((resolve) => {
+    geocoder.addressSearch(item.addr, (result, status) => {
+      if (status === kakao.maps.services.Status.OK) {
+        const lat = parseFloat(result[0].y), lng = parseFloat(result[0].x);
+        geoCache[item.addr] = { lat, lng };
+        localStorage.setItem(CACHE_KEY, JSON.stringify(geoCache));
+        resolve(new kakao.maps.LatLng(lat, lng));
+      } else resolve(null);
+    });
+  });
+}
+
+async function updateMarkers() {
+  clearMap();
+  const sido = document.getElementById('sidoSelect').value;
+  const sigungu = document.getElementById('sigunguSelect').value;
+  if (!sido || !sigungu) return;
+
+  const filtered = allData.filter(d => d.sido === sido && d.sigungu === sigungu);
+  const guide = document.getElementById('guideMsg');
+  guide.innerText = "좌표 보정 및 데이터 렌더링 중...";
+
+  const bounds = new kakao.maps.LatLngBounds();
+  let count = 0;
+
+  for (const item of filtered) {
+    const pos = await getCoord(item);
+    if (pos) {
+      const marker = new kakao.maps.Marker({ position: pos, map: map });
+      kakao.maps.event.addListener(marker, 'click', () => {
+        closeActiveOverlay();
+        const content = `
+          <div class="custom-info">
+            <div class="info-header">
+              <span class="info-name">${item.name}</span>
+              <span class="info-close" onclick="closeActiveOverlay()">&times;</span>
+            </div>
+            <div class="info-addr">${item.addr}</div>
+          </div>`;
+        activeOverlay = new kakao.maps.CustomOverlay({ content, position: pos, yAnchor: 1.4, clickable: true });
+        activeOverlay.setMap(map);
+        map.panTo(pos);
+      });
+      markers.push(marker);
+      bounds.extend(pos);
+      count++;
+    }
+  }
+  if (count > 0) {
+    map.setBounds(bounds);
+    guide.innerText = `${count}개의 위치가 표시되었습니다.`;
+  } else guide.innerText = "해당 지역에 데이터가 없습니다.";
+}
+
+function toggleWatch() {
+  const btn = document.getElementById('myLocBtn');
+  if (watchId !== null) {
+    navigator.geolocation.clearWatch(watchId);
+    watchId = null;
+    if (myLocOverlay) { myLocOverlay.setMap(null); myLocOverlay = null; }
+    btn.classList.remove('on');
+    return;
+  }
+
+  if (navigator.geolocation) {
+    btn.classList.add('on');
+    watchId = navigator.geolocation.watchPosition((pos) => {
+      const loc = new kakao.maps.LatLng(pos.coords.latitude, pos.coords.longitude);
+      const heading = pos.coords.heading || 0;
+      if (!myLocOverlay) {
+        myLocOverlay = new kakao.maps.CustomOverlay({
+          position: loc, zIndex: 200, xAnchor: 0.5, yAnchor: 0.5,
+          content: '<div class="my-loc-dot"><div id="myDir" class="my-loc-dir"></div></div>'
+        });
+        myLocOverlay.setMap(map);
+      } else myLocOverlay.setPosition(loc);
+      const dirEl = document.getElementById('myDir');
+      if (dirEl) dirEl.style.transform = `translateX(-50%) rotate(${heading}deg)`;
+      map.panTo(loc);
+    }, (err) => {
+      stopWatchUI();
+    }, { enableHighAccuracy: true, maximumAge: 0 });
+  }
+}
+
+function stopWatchUI() {
+  if(watchId) navigator.geolocation.clearWatch(watchId);
+  watchId = null;
+  if (myLocOverlay) { myLocOverlay.setMap(null); myLocOverlay = null; }
+  document.getElementById('myLocBtn').classList.remove('on');
+}
+
+document.getElementById('myLocBtn').onclick = toggleWatch;
+init();
+</script>
+</body>
+</html>
